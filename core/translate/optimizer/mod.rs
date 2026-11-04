@@ -4932,6 +4932,7 @@ mod tests {
             DoubleQuotedDml::Enabled,
             crate::sync::Arc::new(crate::dialect::SqliteDialect),
             None,
+            crate::security::roles::RoleId::SUPERUSER,
         )
     }
 
