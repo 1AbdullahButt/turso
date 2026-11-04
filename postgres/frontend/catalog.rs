@@ -440,7 +440,7 @@ impl SnapshotRows for PgClassTable {
         let indexes = catalog_indexes(&schema);
         let relkind: &'static str = RelationKind::Table.into();
 
-        for (i, (namespace, _, table)) in tables.iter().enumerate() {
+        for (i, (namespace, table_name, table)) in tables.iter().enumerate() {
             let btree = match table.as_ref() {
                 Table::BTree(bt) => bt,
                 _ => continue,
@@ -449,6 +449,7 @@ impl SnapshotRows for PgClassTable {
             let relnatts = btree.columns().len() as i64;
             let relhasindex = i64::from(indexes.iter().any(|index| index.table_oid == table_oid));
             let relchecks = btree.check_constraints.len() as i64;
+            let relrowsecurity = i64::from(schema.policies.is_enabled(*namespace, table_name));
 
             rows.push(vec![
                 Value::from_i64(table_oid),                          // oid
@@ -473,7 +474,7 @@ impl SnapshotRows for PgClassTable {
                 Value::from_i64(0),                                  // relhasrules
                 Value::from_i64(0),                                  // relhastriggers
                 Value::from_i64(0),                                  // relhassubclass
-                Value::from_i64(0),                                  // relrowsecurity
+                Value::from_i64(relrowsecurity),                     // relrowsecurity
                 Value::from_i64(0),                                  // relforcerowsecurity
                 Value::from_i64(1),                                  // relispopulated
                 Value::Text("d".into()),                             // relreplident
