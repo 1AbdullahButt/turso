@@ -1481,6 +1481,10 @@ pub enum AlterTableBody {
     },
     /// `DROP COLUMN`
     DropColumn(Name), // TODO distinction between DROP and DROP COLUMN
+    /// `ENABLE ROW LEVEL SECURITY`
+    EnableRowSecurity,
+    /// `DISABLE ROW LEVEL SECURITY`
+    DisableRowSecurity,
 }
 
 /// Operator mapping in a `CREATE TYPE` body

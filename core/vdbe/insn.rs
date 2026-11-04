@@ -1916,6 +1916,14 @@ pub enum Insn {
         name: String,
         superuser: bool,
     },
+    /// Enable or disable row-level security for a table in the in-memory
+    /// policy catalog after its row was inserted or deleted
+    SetRowSecurity {
+        db: usize,
+        namespace: crate::namespace::NamespaceId,
+        table_name: String,
+        enabled: bool,
+    },
 
     /// Close a cursor.
     Close {
@@ -2571,6 +2579,7 @@ impl InsnVariants {
             InsnVariants::SequenceCommitInnerTx => execute::op_sequence_commit_inner_tx,
             InsnVariants::AddType => execute::op_add_type,
             InsnVariants::AddRole => execute::op_add_role,
+            InsnVariants::SetRowSecurity => execute::op_set_row_security,
             InsnVariants::DropView => execute::op_drop_view,
             InsnVariants::Close => execute::op_close,
             InsnVariants::IsNull => execute::op_is_null,
@@ -2718,6 +2727,7 @@ impl Insn {
             | Self::SequenceCommitInnerTx { .. }
             | Self::AddType { .. }
             | Self::AddRole { .. }
+            | Self::SetRowSecurity { .. }
             | Self::ParseSchema { .. }
             | Self::PopulateMaterializedViews { .. }
             | Self::SetCookie { .. }

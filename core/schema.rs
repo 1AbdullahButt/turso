@@ -112,6 +112,7 @@ impl Trigger {
     }
 }
 
+use crate::security::policy::PolicyCatalog;
 use crate::security::roles::RoleCatalog;
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
@@ -1107,6 +1108,8 @@ pub struct Schema {
 
     /// The roles of the database. Copies of the schema share them.
     pub roles: Arc<RoleCatalog>,
+    /// The tables with row-level security. Copies of the schema share them.
+    pub policies: Arc<PolicyCatalog>,
 }
 
 /// Materialized views the loader read before the names of the namespaces,
@@ -1304,6 +1307,7 @@ impl Schema {
             namespace_names_loaded: !dialect.supports_namespaces(),
             pending_materialized_views: None,
             roles: Arc::default(),
+            policies: Arc::default(),
         };
         dialect.register_catalog(&mut schema, enable_custom_types)?;
         Ok(schema)
@@ -4596,6 +4600,7 @@ impl TryClone for Schema {
             namespace_names_loaded: self.namespace_names_loaded,
             pending_materialized_views: self.pending_materialized_views.clone(),
             roles: self.roles.clone(),
+            policies: self.policies.clone(),
             dropped_root_pages: self.dropped_root_pages.try_clone()?,
             type_registry: self.type_registry.try_clone()?,
             custom_types_enabled: self.custom_types_enabled,

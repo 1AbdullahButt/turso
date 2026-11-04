@@ -2,6 +2,7 @@ use crate::alloc::TursoIteratorExt;
 use crate::namespace::{demangle_name, NamespaceId, NamespaceRef};
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
+use crate::translate::row_security;
 use crate::{turso_assert_eq, turso_assert_ne, SymbolTable};
 use turso_parser::{
     ast::{self, TableInternalId},
@@ -783,6 +784,21 @@ pub fn translate_alter_table(
     let Some(original_btree) = table.btree() else {
         crate::bail_parse_error!("ALTER TABLE is only supported for BTree tables");
     };
+    // Row-level security does not change the table's rows or columns, so
+    // the materialized views that read the table do not matter.
+    match alter_table {
+        ast::AlterTableBody::EnableRowSecurity => {
+            return row_security::translate_set_row_security(
+                namespace, table_name, true, resolver, program,
+            );
+        }
+        ast::AlterTableBody::DisableRowSecurity => {
+            return row_security::translate_set_row_security(
+                namespace, table_name, false, resolver, program,
+            );
+        }
+        _ => {}
+    }
 
     // Check if this table has dependent materialized views
     let dependent_views = resolver.with_schema(database_id, |s| {
@@ -1748,6 +1764,10 @@ pub fn translate_alter_table(
                 from: table_name.to_owned(),
                 to: new_name.to_owned(),
             });
+            row_security::emit_rename_table(namespace, table_name, new_name, resolver, program)?;
+        }
+        ast::AlterTableBody::EnableRowSecurity | ast::AlterTableBody::DisableRowSecurity => {
+            unreachable!("row-level security changes return before the dependent view check")
         }
         body @ (ast::AlterTableBody::AlterColumn { .. }
         | ast::AlterTableBody::RenameColumn { .. }) => {
@@ -2412,6 +2432,9 @@ fn reject_alter_of_view(
         }
         ast::AlterTableBody::DropColumn(_) => {
             crate::bail_parse_error!("cannot drop column from view \"{view_name}\"")
+        }
+        ast::AlterTableBody::EnableRowSecurity | ast::AlterTableBody::DisableRowSecurity => {
+            crate::bail_parse_error!("\"{view_name}\" is not a table")
         }
     }
 }

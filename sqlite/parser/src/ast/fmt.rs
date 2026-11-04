@@ -1715,8 +1715,21 @@ impl ToTokens for AlterTableBody {
                 s.append(TK_COLUMNKW, None)?;
                 name.to_tokens(s, context)
             }
+            Self::EnableRowSecurity => row_security_to_tokens(s, "ENABLE"),
+            Self::DisableRowSecurity => row_security_to_tokens(s, "DISABLE"),
         }
     }
+}
+
+/// `ENABLE ROW LEVEL SECURITY` or `DISABLE ROW LEVEL SECURITY`.
+fn row_security_to_tokens<S: TokenStream + ?Sized>(
+    s: &mut S,
+    enable_or_disable: &str,
+) -> Result<(), S::Error> {
+    for word in [enable_or_disable, "ROW", "LEVEL", "SECURITY"] {
+        s.append(TK_ID, Some(word))?;
+    }
+    Ok(())
 }
 
 impl_display_for_to_tokens!(CreateTableBody);
