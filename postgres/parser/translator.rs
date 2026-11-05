@@ -24,6 +24,10 @@ pub struct TranslateResult {
     pub prereqs: Vec<ast::Stmt>,
     /// The main translated command.
     pub cmd: ast::Cmd,
+    /// Statements that run after the main command, as `ALTER SEQUENCE ...
+    /// OWNED BY` does for a serial column's sequence, which belongs to the
+    /// table once the table exists.
+    pub postreqs: Vec<ast::Stmt>,
 }
 
 /// Translates a PostgreSQL query into Turso's AST
@@ -147,6 +151,7 @@ impl PostgreSQLTranslator {
             return Ok(TranslateResult {
                 prereqs: translated.prereqs,
                 cmd: translated.cmd,
+                postreqs: translated.postreqs,
             });
         }
 
@@ -158,6 +163,7 @@ impl PostgreSQLTranslator {
         Ok(TranslateResult {
             prereqs: vec![],
             cmd,
+            postreqs: vec![],
         })
     }
 
@@ -194,6 +200,7 @@ impl PostgreSQLTranslator {
                 ))
             }
             NodeRef::CreateSeqStmt(seq) => self.translate_create_sequence(seq)?,
+            NodeRef::AlterSeqStmt(alter) => self.translate_alter_sequence(alter)?,
             _ => {
                 return Err(ParseError::ParseError(format!(
                     "{} is not supported",
@@ -271,7 +278,7 @@ impl PostgreSQLTranslator {
     fn translate_create_table(
         &self,
         create: &pg_query::protobuf::CreateStmt,
-    ) -> Result<(ast::Stmt, Vec<String>), ParseError> {
+    ) -> Result<(ast::Stmt, Vec<(String, String)>), ParseError> {
         use pg_query::protobuf::node::Node;
         use pg_query::protobuf::ConstrType;
 
@@ -314,7 +321,7 @@ impl PostgreSQLTranslator {
         let mut columns = Vec::new();
         let mut table_constraints = Vec::new();
         // Collect implicit sequence names for serial columns
-        let mut serial_sequences: Vec<String> = Vec::new();
+        let mut serial_sequences: Vec<(String, String)> = Vec::new();
 
         // Extract table name for serial sequence naming
         let tbl_name_str = tbl_name.name.as_str().to_string();
@@ -489,8 +496,8 @@ impl PostgreSQLTranslator {
         let namespace = serial_sequence_namespace(tbl_name);
 
         let prereqs = serial_sequences
-            .into_iter()
-            .map(|seq_name| ast::Stmt::CreateSequence {
+            .iter()
+            .map(|(seq_name, _)| ast::Stmt::CreateSequence {
                 if_not_exists: true,
                 seq_name: ast::QualifiedName::fullname(
                     exact_name(&namespace),
@@ -503,11 +510,81 @@ impl PostgreSQLTranslator {
                 cycle: false,
             })
             .collect();
+        // PostgreSQL links a serial column's sequence to the column once the
+        // table exists, so the sequence belongs to the table.
+        let postreqs = serial_sequences
+            .iter()
+            .map(|(seq_name, column)| ast::Stmt::AlterSequenceOwnedBy {
+                seq_name: ast::QualifiedName::fullname(
+                    exact_name(&namespace),
+                    exact_name(seq_name),
+                ),
+                owner: Some((tbl_name.clone(), exact_name(column))),
+            })
+            .collect();
 
         Ok(TranslateResult {
             prereqs,
             cmd: ast::Cmd::Stmt(stmt),
+            postreqs,
         })
+    }
+
+    /// Translates `ALTER SEQUENCE name OWNED BY { table.column | NONE }`, the
+    /// one ALTER SEQUENCE form supported.
+    fn translate_alter_sequence(
+        &self,
+        alter: &pg_query::protobuf::AlterSeqStmt,
+    ) -> Result<ast::Stmt, ParseError> {
+        use pg_query::protobuf::node::Node;
+
+        let Some(sequence) = &alter.sequence else {
+            return Err(ParseError::ParseError(
+                "ALTER SEQUENCE: missing name".to_string(),
+            ));
+        };
+        if alter.missing_ok {
+            return Err(not_supported("ALTER SEQUENCE IF EXISTS"));
+        }
+        let seq_name = self.qualified_name_from_range_var(sequence)?;
+        let mut owner = None;
+        for option in &alter.options {
+            let Some(Node::DefElem(elem)) = option.node.as_ref() else {
+                continue;
+            };
+            if elem.defname != "owned_by" {
+                return Err(not_supported(format!(
+                    "ALTER SEQUENCE {}",
+                    elem.defname.to_uppercase().replace('_', " ")
+                )));
+            }
+            let Some(Node::List(list)) = elem.arg.as_ref().and_then(|arg| arg.node.as_ref()) else {
+                return Err(ParseError::ParseError(
+                    "ALTER SEQUENCE OWNED BY: invalid owner".to_string(),
+                ));
+            };
+            let names = extract_key_columns(&list.items)?;
+            owner = Some(match names.as_slice() {
+                [none] if none.eq_ignore_ascii_case("none") => None,
+                [table, column] => Some((
+                    ast::QualifiedName::single(exact_name(table)),
+                    exact_name(column),
+                )),
+                [schema, table, column] => Some((
+                    ast::QualifiedName::fullname(exact_name(schema), exact_name(table)),
+                    exact_name(column),
+                )),
+                _ => {
+                    return Err(ParseError::ParseError(
+                        "invalid OWNED BY option".to_string(),
+                    ))
+                }
+            });
+        }
+        let Some(owner) = owner else {
+            return Err(not_supported("ALTER SEQUENCE without OWNED BY"));
+        };
+        Ok(ast::Stmt::AlterSequenceOwnedBy { seq_name, owner })
     }
 
     /// Translate a single PG column definition for CREATE TABLE to a Turso AST ColumnDefinition.
@@ -517,7 +594,7 @@ impl PostgreSQLTranslator {
         col_def: &pg_query::protobuf::ColumnDef,
         has_table_pk: bool,
         tbl_name: &ast::QualifiedName,
-        serial_sequences: &mut Vec<String>,
+        serial_sequences: &mut Vec<(String, String)>,
         check_names: &mut std::collections::HashSet<String>,
     ) -> Result<ast::ColumnDefinition, ParseError> {
         use pg_query::protobuf::node::Node;
@@ -642,7 +719,7 @@ impl PostgreSQLTranslator {
             } else {
                 format!("{}.{seq_name}", serial_sequence_namespace(tbl_name))
             };
-            serial_sequences.push(seq_name);
+            serial_sequences.push((seq_name, name.clone()));
             default_expr = Some(ast::Expr::FunctionCall {
                 name: exact_name("nextval"),
                 distinctness: None,

@@ -91,15 +91,20 @@ pub fn open_database_with_io(
     }
     let file = io.open_file(path, flags, true)?;
     let db_file = Arc::new(turso_core::storage::database::DatabaseFile::new(file));
-    turso_core::Database::open(
+    let db = turso_core::Database::open(
         io,
         path,
         turso_core::OpenOptions::new(Arc::new(PostgresDialect))
             .storage(db_file)
             .flags(flags)
             .db_opts(opts.with_mvcc(true)),
-    )
-    .map_err(Into::into)
+    )?;
+    // After the open, the classes table exists before the database holds
+    // any relation, and every relation gets its row from its CREATE. A
+    // database with relations but no catalog is from an earlier tursopg and
+    // is refused.
+    crate::classes::ensure_classes_table(&db, flags.contains(turso_core::OpenFlags::ReadOnly))?;
+    Ok(db)
 }
 
 /// Refuses an existing file whose tables are in no schema before it is
@@ -432,7 +437,7 @@ fn prepare_statement_inner(
     let role = tx_role(translated.cmd.stmt());
     let post_run = tx_state_post_run(pg_conn, translated.cmd.stmt(), role);
 
-    if translated.prereqs.is_empty() {
+    if translated.prereqs.is_empty() && translated.postreqs.is_empty() {
         return pg_conn
             .conn
             .prepare_translated_cmd(translated.cmd, &sql)
@@ -446,9 +451,11 @@ fn prepare_statement_inner(
             });
     }
 
-    // Validate prerequisites and the target command during prepare without
-    // executing any writes. Side-effecting prerequisites run atomically with
-    // the command only when the returned Statement is actually executed.
+    // Validate the prerequisites and the target command during prepare
+    // without executing any writes. What follows the command names what the
+    // command creates, so it can only be prepared once the command has run.
+    // Side-effecting prerequisites run atomically with the command only when
+    // the returned Statement is actually executed.
     for prereq in &translated.prereqs {
         let input = prereq.to_string();
         let _ = pg_conn
@@ -468,6 +475,7 @@ fn prepare_statement_inner(
             DeferredOperation::Translated {
                 prereqs: translated.prereqs,
                 cmd: Box::new(cmd),
+                postreqs: translated.postreqs,
                 sql: sql.into_owned(),
             },
         ),
@@ -592,6 +600,9 @@ enum DeferredOperation {
     Translated {
         prereqs: Vec<ast::Stmt>,
         cmd: Box<ast::Cmd>,
+        /// Statements that run after the command, as `ALTER SEQUENCE ...
+        /// OWNED BY` does for a serial column's sequence.
+        postreqs: Vec<ast::Stmt>,
         sql: String,
     },
     Frontend(FrontendStmt),
@@ -623,6 +634,9 @@ enum DeferredWork {
 
 struct PrerequisiteState {
     commands: CommandSequence,
+    /// The position of the command itself among the statements, after the
+    /// prerequisites and before what follows it.
+    target_index: usize,
     target_exists: bool,
 }
 
@@ -1016,27 +1030,33 @@ impl DeferredOperation {
         active: &mut Option<crate::Statement>,
     ) -> Result<Option<DeferredWork>> {
         match self {
-            Self::Translated { prereqs, cmd, sql } => {
-                let mut statements: Vec<_> = prereqs
-                    .iter()
-                    .map(|stmt| DeferredStatement {
-                        command: DeferredCommand::Translated(
-                            ast::Cmd::Stmt(stmt.clone()),
-                            stmt.to_string(),
-                        ),
-                        context: CommandContext::Default,
-                    })
-                    .collect();
+            Self::Translated {
+                prereqs,
+                cmd,
+                postreqs,
+                sql,
+            } => {
+                let translated = |stmt: &ast::Stmt| DeferredStatement {
+                    command: DeferredCommand::Translated(
+                        ast::Cmd::Stmt(stmt.clone()),
+                        stmt.to_string(),
+                    ),
+                    context: CommandContext::Default,
+                };
+                let mut statements: Vec<_> = prereqs.iter().map(translated).collect();
+                let target_index = statements.len();
                 statements.push(DeferredStatement {
                     command: DeferredCommand::Translated((**cmd).clone(), sql.clone()),
                     context: CommandContext::Default,
                 });
+                statements.extend(postreqs.iter().map(translated));
                 *active = prepare_create_table_target_check(conn, cmd)?.map(crate::Statement::new);
                 Ok(Some(DeferredWork::Prerequisites(PrerequisiteState {
                     commands: CommandSequence {
                         statements,
                         index: 0,
                     },
+                    target_index,
                     target_exists: false,
                 })))
             }
@@ -1189,7 +1209,11 @@ impl DeferredWork {
 impl PrerequisiteState {
     fn finish_inspection(&mut self) -> bool {
         if self.target_exists {
-            self.commands.index = self.commands.statements.len() - 1;
+            // Only the command itself runs, which then does nothing, as
+            // CREATE TABLE IF NOT EXISTS does: neither the prerequisites nor
+            // what follows the command.
+            self.commands.statements.truncate(self.target_index + 1);
+            self.commands.index = self.target_index;
         }
         !self.target_exists
     }
@@ -1435,12 +1459,7 @@ fn relation_name_is_taken(
             let ns = namespace.target.id;
             (
                 schema.get_table(ns, table).is_some() && !schema.is_materialized_view(ns, table),
-                schema.get_table(ns, name).is_some()
-                    || schema.get_view(ns, name).is_some()
-                    || schema.has_sequence(ns, name)
-                    || schema
-                        .indexes(ns)
-                        .any(|index| index.name.eq_ignore_ascii_case(name)),
+                schema.relation_kind(ns, name).is_some(),
             )
         });
         taken = name_exists;
