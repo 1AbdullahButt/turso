@@ -15204,6 +15204,34 @@ pub fn op_add_role(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_relation_change(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        RelationChange {
+            db,
+            change,
+            value_regs
+        },
+        insn
+    );
+    let values = value_regs
+        .iter()
+        .map(|reg| state.registers[*reg].get_value().clone())
+        .collect::<Vec<Value>>();
+    let dialect = program.connection.dialect();
+    program
+        .connection
+        .with_database_schema_mut(*db, |schema| {
+            dialect.apply_relation_change(schema, change, &values)
+        })??;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 /// Compute the next value of a sequence from a watermark row that has
 /// already been loaded into registers by the surrounding bytecode. Pure
 /// arithmetic — no I/O. The translator emits a cursor seek + Column reads
