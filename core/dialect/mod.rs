@@ -20,11 +20,12 @@ pub(crate) use engine::EngineDialect;
 use crate::{
     namespace::NamespaceId,
     schema::{BTreeTable, RelationKind, Schema},
+    security::roles::RoleId,
     vdbe::builder::ProgramBuilder,
     Connection, Func, LimboError, OpenOptions, Result, Value,
 };
 use std::{any::Any, sync::Arc};
-use turso_parser::ast::{Cmd, CreateTableBody, QualifiedName, Stmt};
+use turso_parser::ast::{Cmd, CreateTableBody, QualifiedName, RoleSpec, Stmt};
 
 /// Prefix the PostgreSQL frontend puts before the `CREATE TABLE` text it
 /// stores in `sqlite_schema`.
@@ -61,6 +62,12 @@ pub enum RelationChange {
         namespace: NamespaceId,
         name: String,
         table: Option<String>,
+    },
+    /// `ALTER ... OWNER TO`.
+    ChangeOwner {
+        namespace: NamespaceId,
+        name: String,
+        new_owner: RoleSpec,
     },
 }
 
@@ -281,7 +288,8 @@ pub trait Dialect: Send + Sync + 'static {
     /// the same transaction as the statement's `sqlite_schema` rows. A table
     /// comes with its automatic indexes in one call. Does nothing for a
     /// dialect without schema state of its own, except that such a dialect
-    /// has no ownership and refuses `ALTER SEQUENCE ... OWNED BY`.
+    /// has no ownership and refuses `ALTER ... OWNER TO` and
+    /// `ALTER SEQUENCE ... OWNED BY`.
     fn translate_relation_changes(
         &self,
         program: &mut ProgramBuilder,
@@ -290,13 +298,20 @@ pub trait Dialect: Send + Sync + 'static {
         changes: &[RelationChange],
     ) -> Result<()> {
         let _ = (program, schema, connection);
-        if changes
-            .iter()
-            .any(|change| matches!(change, RelationChange::OwnedBy { .. }))
-        {
-            return Err(LimboError::ParseError(
-                "ALTER SEQUENCE ... OWNED BY is not supported".to_string(),
-            ));
+        for change in changes {
+            match change {
+                RelationChange::ChangeOwner { .. } => {
+                    return Err(LimboError::ParseError(
+                        "ALTER ... OWNER TO is not supported".to_string(),
+                    ));
+                }
+                RelationChange::OwnedBy { .. } => {
+                    return Err(LimboError::ParseError(
+                        "ALTER SEQUENCE ... OWNED BY is not supported".to_string(),
+                    ));
+                }
+                _ => {}
+            }
         }
         Ok(())
     }
@@ -321,6 +336,19 @@ pub trait Dialect: Send + Sync + 'static {
     /// made while it was attached could not be opened later.
     fn supports_relation_ddl_in_attached_databases(&self) -> bool {
         true
+    }
+
+    /// The role that owns relation `name` of `namespace`, when the dialect
+    /// stores ownership. None means ownership is unknown, and only a
+    /// superuser may drop or alter the relation.
+    fn relation_owner(
+        &self,
+        schema: &Schema,
+        namespace: NamespaceId,
+        name: &str,
+    ) -> Option<RoleId> {
+        let _ = (schema, namespace, name);
+        None
     }
 
     /// The namespaces of a database that has never created or dropped one.
